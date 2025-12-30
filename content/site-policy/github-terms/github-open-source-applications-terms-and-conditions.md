@@ -1,35 +1,202 @@
----
-title: GitHub Open Source Applications Terms and Conditions
-redirect_from:
-  - /articles/github-open-source-applications-terms-and-conditions
-  - /github/site-policy/github-open-source-applications-terms-and-conditions
-versions:
-  fpt: '*'
-topics:
-  - Policy
-  - Legal
----
+#!/usr/bin/env bash
+#
+# destroy_github_all.sh
+# - Dry-run by default: daftar semua resource yang akan dihapus.
+# - Untuk benar-benar menjalankan penghapusan, atur EXECUTE="YES_I_UNDERSTAND_DELETE_PERMANENTLY"
+# - Requires: curl, jq
+#
+# Usage (dry-run):
+#   GITHUB_TOKEN="ghp_xxx" ./destroy_github_all.sh
+# To perform destructive actions:
+#   GITHUB_TOKEN="ghp_xxx" EXECUTE="YES_I_UNDERSTAND_DELETE_PERMANENTLY" ./destroy_github_all.sh
+#
+set -euo pipefail
 
-These GitHub Open Source Applications Terms and Conditions ("Application Terms") are a legal agreement between you (either as an individual or on behalf of an entity) and GitHub, Inc. regarding your use of GitHub's applications, such as GitHub Desktop™ and associated documentation ("Software"). These Application Terms apply to the executable code version of the Software. Source code for the Software is available separately and free of charge under open source software license agreements. If you do not agree to all of the terms in these Application Terms, do not download, install, use, or copy the Software.
+# Safety checks
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Error: curl diperlukan. Install curl dan ulangi." >&2
+  exit 2
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq diperlukan. Install jq dan ulangi." >&2
+  exit 2
+fi
 
-## Connecting to GitHub
+: "${GITHUB_TOKEN:?GITHUB_TOKEN environment variable must be set (PAT with appropriate scopes)}"
 
-If you configure the Software to work with one or more accounts on the GitHub.com website or with a deployment of GitHub Enterprise Server, your use of the Software will also be governed by your applicable GitHub.com website Terms of Service and/or the license agreement applicable to your deployment of GitHub Enterprise Server ("GitHub Terms").
+API="https://api.github.com"
+AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
+PER_PAGE=100
 
-Any use of the Software that violates your applicable GitHub Terms will also be a violation of these Application Terms.
+# Execution guard: must set EXECUTE env to the exact phrase to actually delete.
+EXECUTE="${EXECUTE:-}"
+EXECUTE_PHRASE="YES_I_UNDERSTAND_DELETE_PERMANENTLY"
 
-## Open Source Licenses and Notices
+is_execute_run() {
+  [ "$EXECUTE" = "$EXECUTE_PHRASE" ]
+}
 
-The open source license for the Software is included in the "Open Source Notices" documentation that is included with the Software. That documentation also includes copies of all applicable open source licenses.
+echo "===== GitHub Mass-Delete Script (dry-run by default) ====="
+echo "This script will operate on resources your token has permission to modify."
+echo "If you REALLY want to proceed with permanent deletion, set:"
+echo "  EXECUTE=\"$EXECUTE_PHRASE\""
+echo
 
-To the extent the terms of the licenses applicable to open source components require GitHub to make an offer to provide source code in connection with the Software, such offer is hereby made, and you may exercise it by contacting GitHub: https://github.com/contact
+# Helper: paginated GET
+paged_get() {
+  local url="$1"
+  local page=1
+  while :; do
+    resp=$(curl -sS -H "$AUTH_HEADER" "$url&per_page=$PER_PAGE&page=$page")
+    if [ "$(echo "$resp" | jq 'length')" -eq 0 ]; then
+      break
+    fi
+    echo "$resp"
+    page=$((page+1))
+  done
+}
 
-Unless otherwise agreed to in writing with GitHub, your agreement with GitHub will always include, at a minimum, these Application Terms. Open source software licenses for the Software's source code constitute separate written agreements. To the limited extent that the open source software licenses expressly supersede these Application Terms, the open source licenses govern your agreement with GitHub for the use of the Software or specific included components of the Software.
+# 1) List user info (for safety)
+user_login=$(curl -sS -H "$AUTH_HEADER" "$API/user" | jq -r .login)
+if [ "$user_login" = "null" ] || [ -z "$user_login" ]; then
+  echo "Gagal mengambil informasi user. Periksa token." >&2
+  exit 3
+fi
+echo "Authenticated as: $user_login"
+echo
 
-## GitHub's Logos
+# Confirm interactive prompt before any destructive run (extra guard)
+if is_execute_run; then
+  echo "EXECUTION MODE: WILL PERFORM DELETES (permanent)."
+  echo "FINAL CHECK: Ketik nama akun Anda EXACTLY untuk melanjutkan: $user_login"
+  read -r confirmname
+  if [ "$confirmname" != "$user_login" ]; then
+    echo "Nama tidak cocok. Dibatalkan."
+    exit 1
+  fi
+else
+  echo "DRY-RUN mode: tidak akan melakukan penghapusan. Untuk mengaktifkan penghapusan, set EXECUTE to $EXECUTE_PHRASE"
+  echo
+fi
 
-The license grant included with the Software is not for GitHub's trademarks, which include the Software logo designs. GitHub reserves all trademark and copyright rights in and to all GitHub trademarks. GitHub's logos include, for instance, the stylized designs that include "logo" in the file title in the "logos" folder.
+# FUNCTIONS TO COLLECT AND (optionally) DELETE
 
+# Delete repositories owned by the authenticated user
+handle_repos() {
+  echo "=== Checking repositories owned by $user_login ==="
+  repos_json=$(curl -sS -H "$AUTH_HEADER" "$API/user/repos?type=owner&per_page=$PER_PAGE")
+  repos=$(echo "$repos_json" | jq -r '.[].full_name')
+  if [ -z "$repos" ]; then
+    echo "(no owner repos found)"
+    return
+  fi
+
+  echo "Repositories found (owner):"
+  echo "$repos" | sed 's/^/ - /'
+  echo
+
+  if is_execute_run; then
+    for r in $repos; do
+      echo "Deleting repository: $r"
+      resp_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "$AUTH_HEADER" "$API/repos/$r")
+      if [ "$resp_code" -eq 204 ]; then
+        echo "  OK: $r deleted"
+      else
+        echo "  WARNING: Failed to delete $r, HTTP $resp_code"
+      fi
+    done
+  fi
+}
+
+# Delete gists
+handle_gists() {
+  echo "=== Checking Gists ==="
+  gists_json=$(curl -sS -H "$AUTH_HEADER" "$API/gists?per_page=$PER_PAGE")
+  gist_ids=$(echo "$gists_json" | jq -r '.[].id')
+  if [ -z "$gist_ids" ]; then
+    echo "(no gists found)"
+    return
+  fi
+  echo "Gists found:"
+  echo "$gist_ids" | sed 's/^/ - /'
+  echo
+  if is_execute_run; then
+    for gid in $gist_ids; do
+      echo "Deleting gist $gid"
+      resp_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "$AUTH_HEADER" "$API/gists/$gid")
+      if [ "$resp_code" -eq 204 ]; then
+        echo "  OK: gist $gid deleted"
+      else
+        echo "  WARNING: Failed to delete gist $gid, HTTP $resp_code"
+      fi
+    done
+  fi
+}
+
+# Delete public SSH keys for authenticated user
+handle_user_keys() {
+  echo "=== Checking SSH public keys for user ==="
+  keys_json=$(curl -sS -H "$AUTH_HEADER" "$API/user/keys")
+  key_ids=$(echo "$keys_json" | jq -r '.[].id')
+  if [ -z "$key_ids" ]; then
+    echo "(no user SSH keys found)"
+    return
+  fi
+  echo "User SSH key IDs:"
+  echo "$key_ids" | sed 's/^/ - /'
+  echo
+  if is_execute_run; then
+    for kid in $key_ids; do
+      echo "Deleting SSH key id=$kid"
+      resp_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "$AUTH_HEADER" "$API/user/keys/$kid")
+      if [ "$resp_code" -eq 204 ]; then
+        echo "  OK: key $kid deleted"
+      else
+        echo "  WARNING: Failed to delete key $kid, HTTP $resp_code"
+      fi
+    done
+  fi
+}
+
+# For each repo: delete deploy keys, webhooks, secrets, releases, artifacts
+handle_repo_level() {
+  echo "=== Scanning each owner repo for deploy-keys, webhooks, secrets and releases ==="
+  repos_json=$(curl -sS -H "$AUTH_HEADER" "$API/user/repos?type=owner&per_page=$PER_PAGE")
+  repos=$(echo "$repos_json" | jq -r '.[].full_name')
+  if [ -z "$repos" ]; then
+    echo "(no owner repos found)"
+    return
+  fi
+  for r in $repos; do
+    owner=$(echo "$r" | cut -d'/' -f1)
+    repo=$(echo "$r" | cut -d'/' -f2)
+    echo "-> Repo: $r"
+
+    # Deploy keys
+    dk_json=$(curl -sS -H "$AUTH_HEADER" "$API/repos/$owner/$repo/keys")
+    dk_ids=$(echo "$dk_json" | jq -r '.[].id')
+    if [ -n "$dk_ids" ]; then
+      echo "   Deploy keys:"
+      echo "$dk_ids" | sed 's/^/    - /'
+      if is_execute_run; then
+        for id in $dk_ids; do
+          echo "    Deleting deploy key $id"
+          resp_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "$AUTH_HEADER" "$API/repos/$owner/$repo/keys/$id")
+          [ "$resp_code" -eq 204 ] && echo "      OK" || echo "      WARN HTTP $resp_code"
+        done
+      fi
+    fi
+
+    # Webhooks (hooks)
+    hooks_json=$(curl -sS -H "$AUTH_HEADER" "$API/repos/$owner/$repo/hooks")
+    hook_ids=$(echo "$hooks_json" | jq -r '.[].id')
+    if [ -n "$hook_ids" ]; then
+      echo "   Webhooks:"
+      echo "$hook_ids" | sed 's/^/    - /'
+      if is_execute_run; then
+        for hid in $hook_ids; do
+          echo "    Deleting hook $hid"
+          resp_code=$(curl -s -o /dev
 The names GitHub, GitHub Desktop, GitHub for Mac, GitHub for Windows, the Octocat, and related GitHub logos and/or stylized names are trademarks of GitHub. You agree not to display or use these trademarks in any manner without GitHub's prior, written permission, except as allowed by GitHub's Logos and Usage Policy: https://github.com/logos.
 
 ## Privacy
